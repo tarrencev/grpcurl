@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -312,6 +313,128 @@ func (d *timingData) Done() {
 	}
 }
 
+// parsedTarget holds the components of a parsed URL target
+type parsedTarget struct {
+	address string // host:port format for gRPC dialing
+	scheme  string // original scheme (http, https, etc.)
+	host    string // hostname or IP
+	port    string // port number
+	path    string // URL path
+	useTLS  bool   // whether to use TLS based on scheme
+	wasURL  bool   // whether the original target was a URL
+}
+
+// parseTarget parses a target address that may be a URL or a simple host:port
+func parseTarget(target string) (*parsedTarget, error) {
+	// Handle special cases first
+	if strings.HasPrefix(target, "unix://") || strings.HasPrefix(target, "xds:///") {
+		return &parsedTarget{
+			address: target,
+			scheme:  "",
+			host:    target,
+			port:    "",
+			path:    "",
+			useTLS:  false,
+			wasURL:  false,
+		}, nil
+	}
+
+	// Try to parse as URL
+	parsed, err := url.Parse(target)
+	if err != nil {
+		// Not a URL, treat as host:port
+		return &parsedTarget{
+			address: target,
+			scheme:  "",
+			host:    target,
+			port:    "",
+			path:    "",
+			useTLS:  false,
+			wasURL:  false,
+		}, nil
+	}
+
+	// Check if this is a real URL with a known scheme or just a host:port
+	if parsed.Scheme != "" && parsed.Scheme != "http" && parsed.Scheme != "https" {
+		// Check if it looks like a simple host:port (scheme would be the hostname)
+		if parsed.Host == "" && parsed.Path == "" && parsed.RawQuery == "" && parsed.Fragment == "" {
+			// This is likely a host:port being misinterpreted as scheme:path
+			return &parsedTarget{
+				address: target,
+				scheme:  "",
+				host:    target,
+				port:    "",
+				path:    "",
+				useTLS:  false,
+				wasURL:  false,
+			}, nil
+		}
+
+		// Unknown scheme, treat as-is
+		return &parsedTarget{
+			address: target,
+			scheme:  parsed.Scheme,
+			host:    target,
+			port:    "",
+			path:    "",
+			useTLS:  false,
+			wasURL:  false,
+		}, nil
+	}
+
+	// If no scheme, treat as host:port
+	if parsed.Scheme == "" {
+		return &parsedTarget{
+			address: target,
+			scheme:  "",
+			host:    target,
+			port:    "",
+			path:    "",
+			useTLS:  false,
+			wasURL:  false,
+		}, nil
+	}
+
+	// Handle HTTP/HTTPS URL schemes
+	if parsed.Scheme == "http" || parsed.Scheme == "https" {
+		host := parsed.Hostname()
+		port := parsed.Port()
+
+		// Set default ports
+		if port == "" {
+			if parsed.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+
+		// Construct address in host:port format
+		address := host + ":" + port
+
+		return &parsedTarget{
+			address: address,
+			scheme:  parsed.Scheme,
+			host:    host,
+			port:    port,
+			path:    parsed.Path,
+			useTLS:  parsed.Scheme == "https",
+			wasURL:  true,
+		}, nil
+	}
+
+	// Fallback: treat as host:port
+	return &parsedTarget{
+		address: target,
+		scheme:  "",
+		host:    target,
+		port:    "",
+		path:    "",
+		useTLS:  false,
+		wasURL:  false,
+	}, nil
+}
+
 func main() {
 	flags.Usage = usage
 	flags.Parse(os.Args[1:])
@@ -324,59 +447,26 @@ func main() {
 		os.Exit(0)
 	}
 
-	// default behavior is to use tls
-	usetls := !*plaintext && !*usealts
-
-	// Do extra validation on arguments and figure out what user asked us to do.
-	if *connectTimeout < 0 {
-		fail(nil, "The -connect-timeout argument must not be negative.")
-	}
-	if *keepaliveTime < 0 {
-		fail(nil, "The -keepalive-time argument must not be negative.")
-	}
-	if *maxTime < 0 {
-		fail(nil, "The -max-time argument must not be negative.")
-	}
-	if *maxMsgSz < 0 {
-		fail(nil, "The -max-msg-sz argument must not be negative.")
-	}
-	if *plaintext && *usealts {
-		fail(nil, "The -plaintext and -alts arguments are mutually exclusive.")
-	}
-	if *insecure && !usetls {
-		fail(nil, "The -insecure argument can only be used with TLS.")
-	}
-	if *cert != "" && !usetls {
-		fail(nil, "The -cert argument can only be used with TLS.")
-	}
-	if *key != "" && !usetls {
-		fail(nil, "The -key argument can only be used with TLS.")
-	}
-	if (*key == "") != (*cert == "") {
-		fail(nil, "The -cert and -key arguments must be used together and both be present.")
-	}
-	if *altsHandshakerServiceAddress != "" && !*usealts {
-		fail(nil, "The -alts-handshaker-service argument must be used with the -alts argument.")
-	}
-	if len(altsTargetServiceAccounts) > 0 && !*usealts {
-		fail(nil, "The -alts-target-service-account argument must be used with the -alts argument.")
-	}
-	if *format != "json" && *format != "text" {
-		fail(nil, "The -format option must be 'json' or 'text'.")
-	}
-	if *emitDefaults && *format != "json" {
-		warn("The -emit-defaults is only used when using json format.")
-	}
-
 	args := flags.Args()
 
 	if len(args) == 0 {
 		fail(nil, "Too few arguments.")
 	}
 	var target string
+	var parsedAddr *parsedTarget
 	if args[0] != "list" && args[0] != "describe" {
 		target = args[0]
 		args = args[1:]
+
+		// Parse the target to handle URLs and extract components
+		var err error
+		parsedAddr, err = parseTarget(target)
+		if err != nil {
+			fail(err, "Failed to parse target address %q", target)
+		}
+
+		// Use the parsed address for dialing
+		target = parsedAddr.address
 	}
 
 	if len(args) == 0 {
@@ -464,6 +554,66 @@ func main() {
 		defer cancel()
 	}
 
+	// default behavior is to use tls
+	usetls := !*plaintext && !*usealts
+	forcePlaintext := *plaintext
+
+	// Override TLS usage based on URL scheme if target was parsed as URL
+	if parsedAddr != nil && parsedAddr.wasURL {
+		if parsedAddr.useTLS && (*plaintext || *usealts) {
+			fail(nil, "Target URL scheme 'https' requires TLS but -plaintext or -alts flag is set.")
+		}
+		if !parsedAddr.useTLS && !*plaintext && !*usealts {
+			// URL scheme is http, force plaintext
+			usetls = false
+			forcePlaintext = true
+		} else if parsedAddr.useTLS && !*plaintext && !*usealts {
+			// URL scheme is https, ensure TLS is used
+			usetls = true
+		}
+	}
+
+	// Do extra validation on arguments and figure out what user asked us to do.
+	if *connectTimeout < 0 {
+		fail(nil, "The -connect-timeout argument must not be negative.")
+	}
+	if *keepaliveTime < 0 {
+		fail(nil, "The -keepalive-time argument must not be negative.")
+	}
+	if *maxTime < 0 {
+		fail(nil, "The -max-time argument must not be negative.")
+	}
+	if *maxMsgSz < 0 {
+		fail(nil, "The -max-msg-sz argument must not be negative.")
+	}
+	if *plaintext && *usealts {
+		fail(nil, "The -plaintext and -alts arguments are mutually exclusive.")
+	}
+	if *insecure && !usetls {
+		fail(nil, "The -insecure argument can only be used with TLS.")
+	}
+	if *cert != "" && !usetls {
+		fail(nil, "The -cert argument can only be used with TLS.")
+	}
+	if *key != "" && !usetls {
+		fail(nil, "The -key argument can only be used with TLS.")
+	}
+	if (*key == "") != (*cert == "") {
+		fail(nil, "The -cert and -key arguments must be used together and both be present.")
+	}
+	if *altsHandshakerServiceAddress != "" && !*usealts {
+		fail(nil, "The -alts-handshaker-service argument must be used with the -alts argument.")
+	}
+	if len(altsTargetServiceAccounts) > 0 && !*usealts {
+		fail(nil, "The -alts-target-service-account argument must be used with the -alts argument.")
+	}
+	if *format != "json" && *format != "text" {
+		fail(nil, "The -format option must be 'json' or 'text'.")
+	}
+	if *emitDefaults && *format != "json" {
+		warn("The -emit-defaults is only used when using json format.")
+	}
+
 	dial := func() *grpc.ClientConn {
 		dialTiming := rootTiming.Child("Dial")
 		defer dialTiming.Done()
@@ -492,7 +642,7 @@ func main() {
 			target = "unix://" + target
 		}
 		var creds credentials.TransportCredentials
-		if *plaintext {
+		if forcePlaintext {
 			if *authority != "" {
 				opts = append(opts, grpc.WithAuthority(*authority))
 			}
@@ -512,6 +662,12 @@ func main() {
 			tlsConf, err := grpcurl.ClientTLSConfig(*insecure, *cacert, *cert, *key)
 			if err != nil {
 				fail(err, "Failed to create TLS config")
+			}
+
+			// For proxy scenarios, ensure TLS ServerName is just the hostname
+			if parsedAddr != nil && parsedAddr.wasURL && parsedAddr.path != "" && parsedAddr.path != "/" {
+				// Set TLS ServerName to just the hostname for certificate verification
+				tlsConf.ServerName = parsedAddr.host
 			}
 
 			sslKeylogFile := os.Getenv("SSLKEYLOGFILE")
@@ -585,6 +741,11 @@ func main() {
 		if err != nil {
 			fail(err, "Failed to expand reflection headers")
 		}
+	}
+
+	// Add path information as custom header for reverse proxy routing
+	if parsedAddr != nil && parsedAddr.wasURL && parsedAddr.path != "" && parsedAddr.path != "/" {
+		addlHeaders = append(addlHeaders, "x-grpc-path: "+parsedAddr.path)
 	}
 
 	var cc *grpc.ClientConn
